@@ -6,3 +6,5 @@ authors = ["Atte Hinkka <atte.hinkka@iki.fi>"]
 [dependencies]
 rustc-serialize = "0.3.14"
 bufstream = "0.1.1"
+time = "0.1"
+
