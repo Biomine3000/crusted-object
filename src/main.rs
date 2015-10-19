@@ -6,7 +6,8 @@ extern crate rustc_serialize;
 use rustc_serialize::json::{ToJson};
 
 extern crate object_system;
-use object_system::{BusinessObject, ReadBusinessObject, };
+use object_system::BusinessObject;
+use object_system::io::ReadBusinessObject;
 
 
 fn main() {
