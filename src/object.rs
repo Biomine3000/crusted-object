@@ -94,6 +94,17 @@ impl BusinessObject {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = self.to_json().to_string().into_bytes();
         result.push(b'\0');
+
+        match self.payload {
+            Some(Payload::Bytes(ref payload)) => {
+                assert!(self.has_payload());
+                assert!(self.size.unwrap() == payload.len());
+
+                result.extend(payload);
+            },
+            None => {}
+        }
+
         result
     }
 

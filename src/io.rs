@@ -175,9 +175,15 @@ impl <S: Read + Write> ReadBusinessObject for BusinessObjectStream<S> {
         };
 
         match read_objects(&self.read_buffer) {
-            Ok((objects, _)) => {
-                // TODO: actual buffer management with consumed et al
-                debug!("Got result: {:?}", objects);
+            Ok((objects, consumed)) => {
+                let mut new_buffer: Vec<u8> = Vec::new();
+
+                for item in self.read_buffer[consumed .. ].iter() {
+                    new_buffer.push(item.clone());
+                }
+
+                self.read_buffer = new_buffer;
+
                 Ok(objects)
             },
             Err(e) => Err(e)

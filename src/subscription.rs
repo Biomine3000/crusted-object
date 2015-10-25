@@ -178,6 +178,7 @@ pub fn routing_decision(natures: Option<Vec<&str>>, event: Option<&str>, payload
             if val.contains(";") {
                 let parts: Vec<&str> = val.split(";").collect();
                 payload_type_aux = Some(parts[0].trim());
+                debug!("Removed trailing parts from type: {} => {}", val, payload_type_aux.unwrap());
             }
         },
         None => {}

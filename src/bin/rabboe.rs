@@ -206,6 +206,7 @@ impl Server {
         match objs_result {
             Ok(objs) => {
                 for obj in objs.into_iter() {
+                    debug!("IN({:?}): {:?}", client_for_token(self, token).peer_addr, obj);
                     self.handle_incoming_object(event_loop, token, Rc::new(obj));
                 }
             },
@@ -446,6 +447,7 @@ impl BusinessClient {
                             panic!("Wrote only {:?}, should have written {:?}", n, bytes.len());
                         }
                         debug!("Sent object to {:?}", self);
+                        let _ = self.stream.flush();
                         trace!("CONN : we wrote {} bytes", n);
                         Ok(())
                     },
@@ -465,6 +467,7 @@ impl BusinessClient {
     }
 
     fn send_object(&mut self, object: Rc<BusinessObject>) -> io::Result<()> {
+        debug!("OUT({:?}): {:?}", self.peer_addr, object);
         self.send_queue.push(object);
         self.interest.insert(EventSet::writable());
         Ok(())
