@@ -6,12 +6,12 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
 extern crate env_logger;
 
-
 extern crate rustc_serialize;
-use rustc_serialize::json::{Json, ToJson};
+use rustc_serialize::json::ToJson;
 
 extern crate mio;
 use mio::*;
@@ -20,15 +20,13 @@ use mio::tcp::*;
 use mio::util::Slab;
 
 extern crate time;
-use time::{Timespec, Duration, get_time};
-
-extern crate bufstream;
-use bufstream::BufStream;
+use time::{Timespec, get_time};
 
 extern crate object_system;
-use object_system::{BusinessObject, Payload};
-use object_system::server::*;
+use object_system::BusinessObject;
 use object_system::io::*;
+use object_system::subscription;
+use object_system::subscription::{BusinessSubscription, BusinessSubscriptionError, routing_decision};
 
 
 fn parse_subscription(obj: &BusinessObject) -> Result<BusinessSubscription, BusinessSubscriptionError> {
@@ -38,11 +36,12 @@ fn parse_subscription(obj: &BusinessObject) -> Result<BusinessSubscription, Busi
             if event == "routing/subscribe" {
                 match obj.metadata.get("subscriptions") {
                     Some(subscriptions) => {
-                        match parse_subscriptions(subscriptions) {
+                        match subscription::parse_subscription(subscriptions) {
                             Ok(subs) => Ok(subs),
                             Err(e) => Err(e)
                         }
                     },
+                    // TODO: default subscription
                     None => Err(BusinessSubscriptionError::NoSubscriptionMetadataKey)
                 }
             } else {
@@ -134,7 +133,7 @@ impl Server {
                             Ok(addr) => {
                                 info!("Accepted connection from {:?}", addr);
                             },
-                            Err(e) => {
+                            Err(_) => {
                                 self.reregister(event_loop);
                                 return;
                             }
@@ -180,13 +179,19 @@ impl Server {
 
     fn readable(&mut self, event_loop: &mut EventLoop<Server>, token: Token) -> io::Result<()> {
         trace!("Server conn readable, token: {:?}", token);
-        let obj_result = client_for_token(self, token).read_object();
+        let objs_result = client_for_token(self, token).read_objects();
 
-        if obj_result.is_err() {
-            return Ok(());
-        }
+        match objs_result {
+            Ok(objs) => {
+                for obj in objs.into_iter() {
+                    self.handle_incoming_objects(event_loop, token, Rc::new(obj));
+                }
+            },
+            Err(e) => {
+                warn!("Couldn't read objects: {:?}", e);
+            }
+        };
 
-        self.handle_incoming_object(event_loop, token, Rc::new(obj_result.unwrap()));
 
         Ok(())
     }
@@ -208,8 +213,8 @@ impl Server {
         }
     }
 
-    fn handle_incoming_object(&mut self, event_loop: &mut EventLoop<Server>,
-                              token: Token, object: Rc<BusinessObject>) {
+    fn handle_incoming_objects(&mut self, event_loop: &mut EventLoop<Server>,
+                               token: Token, object: Rc<BusinessObject>) {
         match client_for_token(self, token).subscription {
             Some(_) => {
                 trace!("Would handle {:?}", &object);
@@ -219,17 +224,35 @@ impl Server {
 
                 // Queue up a write for all connected clients.
                 for client in self.clients.iter_mut() {
-                    // TODO: actual routing decision
-
                     if client.subscription.is_some() {
-                        client.send_object(object.clone())
-                            .and_then(|_| client.reregister(event_loop))
-                            .unwrap_or_else(|e| {
-                                error!("Failed to queue message for {:?}: {:?}", client.token, e);
-                                bad_tokens.push(client.token)
-                            });
+                        // TODO: extract natures in a separate function
+                        // let natures = match object.metadata.get("natures")
+                        let natures = None;
+
+                        let event: Option<&str> = match object.event {
+                            Some(ref t) => Some(t.as_ref()),
+                            None => None
+                        };
+
+                        let payload_type: Option<&str> = match object._type {
+                            Some(ref t) => Some(t.as_ref()),
+                            None => None
+                        };
+
+                        // TODO: this .clone() sucks, but it's needed for borrow checker. :(
+                        let sub_opt: Option<BusinessSubscription> = client.subscription.clone();
+                        let decision = routing_decision(natures, event, payload_type, &sub_opt.unwrap());
+
+                        if decision {
+                            client.send_object(object.clone())
+                                .and_then(|_| client.reregister(event_loop))
+                                .unwrap_or_else(|e| {
+                                    error!("Failed to queue message for {:?}: {:?}", client.token, e);
+                                    bad_tokens.push(client.token)
+                                });
+                        }
                     } else {
-                        trace!("Not routing {:?} to {:?}", object, client);
+                        trace!("Not subscribed; not routing {:?} to {:?}", object, client);
                     }
                 }
 
@@ -243,9 +266,10 @@ impl Server {
                     Ok(subscription) => {
                         let reply = subscription_reply(&subscription, &object);
                         let client = client_for_token(self, token);
-                        client.send_object(reply);
+                        let _ = client.send_object(reply);
                         client.subscription = Some(subscription);
                         client.last_activity = time::get_time();
+                        // TODO: routing announcements
                     },
                     Err(e) => {
                         warn!("Couldn't parse subscription from client: {:?}", e);
@@ -310,13 +334,15 @@ impl Handler for Server {
 
 
 struct BusinessClient {
-    socket: TcpStream,
+    stream: BusinessObjectStream<TcpStream>,
     token: Token,
     interest: EventSet,
     send_queue: Vec<Rc<BusinessObject>>,
 
     subscription: Option<BusinessSubscription>,
     last_activity: Timespec,
+
+    peer_addr: SocketAddr
 }
 
 
@@ -331,7 +357,7 @@ impl fmt::Debug for BusinessClient {
         write!(f, "BusinessClient(token: {}, last_activity: {}, peer: {}, subscription: {:?})",
                self.token.as_usize(),
                timestamp,
-               self.socket.peer_addr().unwrap(),
+               self.peer_addr,
                self.subscription)
     }
 }
@@ -340,7 +366,9 @@ impl fmt::Debug for BusinessClient {
 impl BusinessClient {
     fn new(socket: TcpStream, token: Token) -> BusinessClient {
         BusinessClient {
-            socket: socket,
+            peer_addr: socket.peer_addr().unwrap().clone(),
+
+            stream: BusinessObjectStream::new(socket),
             token: token,
 
             interest: EventSet::hup(),
@@ -349,12 +377,13 @@ impl BusinessClient {
 
             subscription: Option::None,
             last_activity: time::get_time(),
+
         }
     }
 
-    fn read_object(&mut self) -> io::Result<BusinessObject> {
-        match self.socket.read_business_object() {
-            Ok(obj) => { Ok(obj) }
+    fn read_objects(&mut self) -> io::Result<Vec<BusinessObject>> {
+        match self.stream.read_business_objects() {
+            Ok(objs) => { Ok(objs) }
             Err(e) => { Err(Error::new(ErrorKind::Other, e)) }
         }
     }
@@ -362,10 +391,10 @@ impl BusinessClient {
     fn writable(&mut self) -> io::Result<()> {
         try!(self.send_queue.pop()
             .ok_or(Error::new(ErrorKind::Other, "Could not pop send queue"))
-            .and_then(|mut object| {
+            .and_then(|object| {
                 let bytes = &object.to_bytes();
                 let mut buf = ByteBuf::from_slice(bytes);
-                match self.socket.try_write_buf(&mut buf) {
+                match self.stream.try_write_buf(&mut buf) {
                     Ok(None) => {
                         warn!("Tried to write {}, none written, putting object back to queue", bytes.len());
                         self.send_queue.push(object);
@@ -403,7 +432,7 @@ impl BusinessClient {
     fn register(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
         self.interest.insert(EventSet::readable());
 
-        event_loop.register_opt(&self.socket, self.token, self.interest, 
+        event_loop.register_opt(&self.stream.socket, self.token, self.interest, 
                                 PollOpt::edge() | PollOpt::oneshot()
                                 ).or_else(|e| {
                                     error!("Failed to register {:?}, {:?}", self.token, e);
@@ -412,7 +441,7 @@ impl BusinessClient {
     }
 
     fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-        event_loop.reregister(&self.socket, self.token, self.interest,
+        event_loop.reregister(&self.stream.socket, self.token, self.interest,
                               PollOpt::edge() | PollOpt::oneshot()
                               ).or_else(|e| {
                                   error!("Failed to reregister {:?}, {:?}", self.token, e);

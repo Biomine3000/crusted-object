@@ -2,36 +2,34 @@ use std::cmp::PartialEq;
 use std::collections::BTreeMap;
 use std::error;
 use std::fmt;
+use std::io;
 
-extern crate rustc_serialize;
 use rustc_serialize::json::{ToJson, Json};
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BusinessObject {
     pub event: Option<String>,
     pub _type: Option<String>,
-    pub size: Option<u64>,
+    pub size: Option<usize>,
     pub payload: Option<Payload>,
     pub metadata: BTreeMap<String,Json>
 }
 
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub enum Payload {
     Bytes(Vec<u8>)
 }
 
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Debug)]
 pub enum ReadBusinessObjectError {
-    NoInputError(&'static str),
+    ReadError(io::Error),
 
     JsonSemanticsError(&'static str),
     JsonSyntaxError(String, String),
-    BufferCharacterDecodingError,
-
-    PayloadReadingError
+    BufferCharacterDecodingError
 }
 
 
@@ -47,11 +45,10 @@ impl PartialEq for BusinessObject {
 
 fn extract_reason(error: &ReadBusinessObjectError) -> &str {
     match *error {
-        ReadBusinessObjectError::NoInputError(ref reason) => reason,
         ReadBusinessObjectError::JsonSemanticsError(ref reason) => reason,
         ReadBusinessObjectError::JsonSyntaxError(_, ref reason) => reason,
         ReadBusinessObjectError::BufferCharacterDecodingError => "Character encoding error",
-        ReadBusinessObjectError::PayloadReadingError => "Couldn't read payload"
+        ReadBusinessObjectError::ReadError(_) => "Read error"
     }
 }
 
@@ -99,6 +96,13 @@ impl BusinessObject {
         result.push(b'\0');
         result
     }
+
+    pub fn has_payload(&self) -> bool {
+        match self.size {
+            Some(size) => size > 0,
+            None => false
+        }
+    }
 }
 
 
@@ -139,7 +143,7 @@ impl ToBusinessObject for BTreeMap<String,Json> {
             if value.is_some() {
                 let s = value.unwrap();
                 if s > 0 {
-                    result.size = Some(s);
+                    result.size = Some(s as usize);
                 }
             }
         }
@@ -153,5 +157,40 @@ impl ToBusinessObject for BTreeMap<String,Json> {
         }
 
         result
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use rustc_serialize::json::{Json, ToJson};
+
+    use super::BusinessObject;
+
+
+    #[test]
+    fn smoke_test_serialization_and_deserialization() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("subscriptions".to_string(),
+                        vec!["@routing/*".to_string(), "@services/*".to_string(),
+                             "@ping".to_string(), "@pong".to_string()].to_json());
+        metadata.insert("subscriptions".to_string(), vec!["*".to_string()].to_json());
+
+        let subscription = BusinessObject {
+            _type: None,
+            payload: None,
+            size: None,
+            event: Some("routing/subscribe".to_string()),
+            metadata: metadata,
+        };
+
+        let json_repr_from = subscription.to_json();
+        let string_repr = json_repr_from.to_string();
+        let json_repr_to = Json::from_str(&string_repr).unwrap();
+        let back = BusinessObject::from_json(&json_repr_to).unwrap();
+
+        assert!(json_repr_from == json_repr_to);
+        assert!(subscription == back);
     }
 }
