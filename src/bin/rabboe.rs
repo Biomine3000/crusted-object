@@ -53,11 +53,11 @@ fn parse_subscription(obj: &BusinessObject) -> Result<BusinessSubscription, Busi
 }
 
 
-fn subscription_reply(subscriptions: &BusinessSubscription, response: &BusinessObject) -> Rc<BusinessObject> {
+fn subscription_reply(subscriptions: &BusinessSubscription, request: &BusinessObject) -> Rc<BusinessObject> {
     let mut metadata = BTreeMap::new();
     metadata.insert("subscriptions".to_string(), subscriptions.to_json());
 
-    match response.metadata.get("id") {
+    match request.metadata.get("id") {
         Some(id) => {
             if id.is_string() {
                 metadata.insert("in-reply-to".to_string(), id.as_string().unwrap().to_json());
@@ -71,6 +71,28 @@ fn subscription_reply(subscriptions: &BusinessSubscription, response: &BusinessO
         payload: None,
         size: None,
         event: Some("routing/subscribe/reply".to_string()),
+        metadata: metadata,
+    })
+}
+
+
+fn ping_reply(request: &BusinessObject) -> Rc<BusinessObject> {
+    let mut metadata = BTreeMap::new();
+
+    match request.metadata.get("id") {
+        Some(id) => {
+            if id.is_string() {
+                metadata.insert("in-reply-to".to_string(), id.as_string().unwrap().to_json());
+            }
+        },
+        None => {}
+    }
+
+    Rc::new(BusinessObject {
+        _type: None,
+        payload: None,
+        size: None,
+        event: Some("pong".to_string()),
         metadata: metadata,
     })
 }
@@ -184,7 +206,7 @@ impl Server {
         match objs_result {
             Ok(objs) => {
                 for obj in objs.into_iter() {
-                    self.handle_incoming_objects(event_loop, token, Rc::new(obj));
+                    self.handle_incoming_object(event_loop, token, Rc::new(obj));
                 }
             },
             Err(e) => {
@@ -213,22 +235,43 @@ impl Server {
         }
     }
 
-    fn handle_incoming_objects(&mut self, event_loop: &mut EventLoop<Server>,
+    fn handle_incoming_object(&mut self, event_loop: &mut EventLoop<Server>,
                                token: Token, object: Rc<BusinessObject>) {
         match client_for_token(self, token).subscription {
             Some(_) => {
                 trace!("Would handle {:?}", &object);
                 client_for_token(self, token).last_activity = time::get_time();
 
+                let is_ping = match object.event { Some(ref event) => event == "ping",
+                                                   None => false };
+
                 let mut bad_tokens = Vec::new();
+                if is_ping {
+                    let event: Option<&str> = Some("pong");
 
-                // Queue up a write for all connected clients.
-                for client in self.clients.iter_mut() {
-                    if client.subscription.is_some() {
-                        // TODO: extract natures in a separate function
-                        // let natures = match object.metadata.get("natures")
-                        let natures = None;
+                    // TODO: this .clone() sucks, but it's needed for borrow checker. :(
+                    let sub_opt: Option<BusinessSubscription> = client_for_token(self, token).subscription.clone();
+                    let decision = routing_decision(None, event, None, &sub_opt.unwrap());
 
+                    let pong = ping_reply(&object);
+                    if decision {
+                        client_for_token(self, token).send_object(pong)
+                            .and_then(|_| client_for_token(self, token).reregister(event_loop))
+                            .unwrap_or_else(|e| {
+                                error!("Failed to queue message for {:?}: {:?}", token, e);
+                                bad_tokens.push(token)
+                            });
+                    }
+                } else {
+                    // Queue up a write for all connected clients.
+                    for client in self.clients.iter_mut() {
+                        if client.subscription.is_none() {
+                            trace!("Not subscribed; not routing {:?} to {:?}", object, client);
+                            break;
+                        }
+
+                        let natures = object.natures();
+                    
                         let event: Option<&str> = match object.event {
                             Some(ref t) => Some(t.as_ref()),
                             None => None
@@ -241,7 +284,7 @@ impl Server {
 
                         // TODO: this .clone() sucks, but it's needed for borrow checker. :(
                         let sub_opt: Option<BusinessSubscription> = client.subscription.clone();
-                        let decision = routing_decision(natures, event, payload_type, &sub_opt.unwrap());
+                        let decision = routing_decision(Some(natures), event, payload_type, &sub_opt.unwrap());
 
                         if decision {
                             client.send_object(object.clone())
@@ -251,8 +294,6 @@ impl Server {
                                     bad_tokens.push(client.token)
                                 });
                         }
-                    } else {
-                        trace!("Not subscribed; not routing {:?} to {:?}", object, client);
                     }
                 }
 

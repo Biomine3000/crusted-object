@@ -103,6 +103,30 @@ impl BusinessObject {
             None => false
         }
     }
+
+    pub fn natures(&self) -> Vec<&str> {
+        let mut result = Vec::new();
+
+        match self.metadata.get("natures") {
+            Some(natures) => {
+                match natures.as_array() {
+                    Some(natures) => {
+                        for item in natures {
+                            match item.as_string() {
+                                Some(nature) => { result.push(nature); },
+                                _ => { trace!("Cannot use {} as a nature", item); }
+                            }
+                        }
+                    },
+                    None => {}
+                }
+
+            }
+            None => {}
+        };
+
+        result
+    }
 }
 
 
